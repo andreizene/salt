@@ -238,8 +238,8 @@ def resolve_dns(opts, fallback=True):
         log.debug(
             "Using %d as source port for the master pub", ret["source_publish_port"]
         )
-    ret["master_uri"] = "tcp://{ip}:{port}".format(
-        ip=ret["master_ip"], port=opts["master_port"]
+    ret["master_uri"] = "{transport}://{ip}:{port}".format(
+        transport=opts["transport"], ip=ret["master_ip"], port=opts["master_port"]
     )
     log.debug("Master URI: %s", ret["master_uri"])
 

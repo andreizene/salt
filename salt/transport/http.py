@@ -10,6 +10,7 @@ import json
 import base64
 import logging
 import socket
+import time
 import uuid
 
 # Import Tornado Libs
@@ -41,9 +42,15 @@ else:
     import urllib.parse as urlparse
 # pylint: enable=import-error,no-name-in-module
 
+class BytesDump(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, bytes):                   # deal with bytes
+            return None 
+        return json.JSONEncoder.default(self, obj)   # everything else
 
 class AsyncHTTPReqChannel(salt.transport.abstract.AbstractAsyncReqChannel):
     def __new__(cls, opts, **kwargs):
+        kwargs["crypt"] = "clear"
         return super().__new__(cls, opts, **kwargs)
 
     @classmethod
@@ -51,9 +58,9 @@ class AsyncHTTPReqChannel(salt.transport.abstract.AbstractAsyncReqChannel):
         return super().__key(cls, opts, **kwargs)
 
     def start_channel(self, io_loop, **kwargs):
-        parse = urlparse.urlparse(self.opts["master_uri"])
-        master_host, master_port = parse.netloc.rsplit(":", 1)
-        self.url = "http://" + master_host + ":" + str(master_port) + "/req"
+        publish_port = self.opts.get("publish_port", 4505)
+        master = self.opts["master"]
+        self.url = "http://" + master + ":" + str(publish_port) + "/req"
         self.http_client = salt.ext.tornado.httpclient.AsyncHTTPClient(io_loop=self.io_loop)
 
     def close(self):
@@ -61,10 +68,44 @@ class AsyncHTTPReqChannel(salt.transport.abstract.AbstractAsyncReqChannel):
         if hasattr(self, "http_client"):
             self.http_client.close()
 
+    def publish_dict(self, dicty, tries=3, timeout=60):
+        json_payload = json.dumps(dicty, cls=BytesDump)
+        return self.publish_string(json_payload)
+
+    @salt.ext.tornado.gen.coroutine
+    def _uncrypted_transfer(self, load, tries=3, timeout=60):
+        ret = yield self.publish_dict(
+            self._package_load(load), timeout=timeout
+        )
+        raise salt.ext.tornado.gen.Return(ret)
+
+    @salt.ext.tornado.gen.coroutine
+    def crypted_transfer_decode_dictentry(
+        self, load, dictkey=None, tries=3, timeout=60
+    ):
+        ret = yield self.publish_dict(
+            self._package_load(json.dumps(load, cls=BytesDump)), timeout=timeout
+        )        
+        #data = json.loads()[dictKey]
+        data = {}
+        raise salt.ext.tornado.gen.Return(data)
+
+    @salt.ext.tornado.gen.coroutine
+    def send(self, load, tries=3, timeout=60, raw=False):
+        """
+        Send a request, return a future which will complete when we send the message
+        """
+        try:
+            ret = yield self._uncrypted_transfer(load, tries=tries, timeout=timeout)
+        except salt.ext.tornado.iostream.StreamClosedError:
+            # Convert to 'SaltClientError' so that clients can handle this
+            # exception more appropriately.
+            raise SaltClientError("Connection to master lost")
+        raise salt.ext.tornado.gen.Return(ret)
+
     def publish_string(self, spayload):
-        post_data = {"payload": spayload}
-        body = urlencode(post_data)
-        http_request = salt.ext.tornado.httpclient.HTTPRequest(self.url, method="POST", headers=None, body=body)
+        headers = {"x-ni-api-key": self.opts["x-ni-api-key"]}
+        http_request = salt.ext.tornado.httpclient.HTTPRequest(self.url, method="POST", headers=headers, body=spayload)
 
         return_future = salt.ext.tornado.gen.Future()
         def callback(response):
@@ -72,19 +113,8 @@ class AsyncHTTPReqChannel(salt.transport.abstract.AbstractAsyncReqChannel):
                 # TODO: Deal with errors
                 print("!!", __class__, "Error:", response.error)
             else:
-                spayload = response.body
-                b64payload = spayload.decode("ascii")
-                bpayload = base64.b64decode(b64payload)
-                unpacker = salt.utils.msgpack.Unpacker()
-                unpacker.feed(bpayload)
-                for framed_msg in unpacker:
-                    if six.PY3:
-                        framed_msg = salt.transport.frame.decode_embedded_strs(
-                            framed_msg
-                        )
-                    header = framed_msg['head']
-                    payload = framed_msg['body']
-                    return_future.set_result(payload)
+                payload = response.body
+                return_future.set_result(payload)
                 return
             return_future.set_result(None)
         self.http_client.fetch(http_request, callback)
@@ -102,17 +132,7 @@ class MessageRequestHandler(salt.ext.tornado.web.RequestHandler):
 
     async def post(self):
         spayload = self.get_argument("payload")
-        b64payload = spayload.encode("ascii")
-        bpayload = base64.b64decode(b64payload)
-        unpacker = salt.utils.msgpack.Unpacker()
-        unpacker.feed(bpayload)
-        for framed_msg in unpacker:
-            if six.PY3:
-                framed_msg = salt.transport.frame.decode_embedded_strs(
-                    framed_msg
-                )
-            # header = framed_msg["head"]
-            # payload = framed_msg["body"]
+        for framed_msg in spayload:
             self.callback(None, framed_msg, handler=self)
 
     def on_connection_close(self):
@@ -207,6 +227,8 @@ class AsyncHTTPPubChannel(salt.transport.abstract.AbstractAsyncPubChannel):
     def __init__(self, opts, **kwargs):
         super().__init__(opts, **kwargs)
         self.callback = None
+        self.auth = type('', (), {})()
+        self.auth.gen_token = self.gen_token
 
     def close(self):
         super().close()
@@ -226,13 +248,43 @@ class AsyncHTTPPubChannel(salt.transport.abstract.AbstractAsyncPubChannel):
         self.url = "http://" + self.publish_ip + ":" + str(self.publish_port) + "/message/updates"
         self._fire_http_request()
 
+    def gen_token(self, clear_tok):
+        """
+        Encrypt a string with the minion private key to verify identity
+        with the master.
+
+        :param str clear_tok: A plaintext token to encrypt
+        :return: Encrypted token
+        :rtype: str
+        """
+        return clear_tok
+
+    @salt.ext.tornado.gen.coroutine
+    def connect(self):
+        try:
+            yield self.open_connection()
+            self.connected = True
+        # TODO: better exception handling...
+        except KeyboardInterrupt:  # pylint: disable=try-except-raise
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            if "-|RETRY|-" not in six.text_type(exc):
+                raise SaltClientError(
+                    "Unable to sign_in to master: {0}".format(exc)
+                )  # TODO: better error message
+
     def _fire_http_request(self, cursor=None):
         post_data = {}
         if cursor:
             post_data["cursor"] = cursor
         body = urlencode(post_data)
-        http_request = salt.ext.tornado.httpclient.HTTPRequest(self.url, method="POST", headers=None, body=body)
+        headers = {"x-ni-api-key": self.opts["x-ni-api-key"]}
+        http_request = salt.ext.tornado.httpclient.HTTPRequest(self.url, method="POST", headers=headers, body=body)
         self.http_client = salt.ext.tornado.httpclient.AsyncHTTPClient(io_loop=self.io_loop)
+        
+        # TODO: Read from SSE. Let's sleep now to make it easier for debugging
+        time.sleep(5)
+                
         self.http_client.fetch(http_request, self._handle_response)
 
     def _handle_response(self, response):
@@ -243,32 +295,23 @@ class AsyncHTTPPubChannel(salt.transport.abstract.AbstractAsyncPubChannel):
                 # Fire another long-polling request
                 self._fire_http_request()
         else:
-            messages_dict = json.loads(response.body)
-            messages = messages_dict["messages"]
-            for message in messages:
-                self.feed_unpacker(message['payload'])
-            last_message_id = messages[-1]['_id']
-            # Fire another long-polling request
-            self._fire_http_request(last_message_id)
-
-    def feed_unpacker(self, spayload):
-        b64payload = spayload.encode("ascii")
-        bpayload = base64.b64decode(b64payload)
-        unpacker = salt.utils.msgpack.Unpacker()
-        unpacker.feed(bpayload)
-        for framed_msg in unpacker:
-            if six.PY3:
-                framed_msg = salt.transport.frame.decode_embedded_strs(
-                    framed_msg
-                )
-            header = framed_msg["head"]
-            body = framed_msg["body"]
-            message_id = header.get("mid")
+            message = json.loads(response.body)
             if self.callback:
-                self.io_loop.spawn_callback(self.callback, body)
+                self.io_loop.spawn_callback(self.callback, message)
+            # Fire another long-polling request
+            self._fire_http_request()
 
     def set_callback(self, callback):
         self.callback = callback
+
+    def on_recv(self, callback):
+        """
+        Register an on_recv callback
+        """
+        if callback is None:
+            return self.set_callback(None)
+
+        return self.set_callback(callback)
 
 
 class MessageBuffer(object):
@@ -279,7 +322,7 @@ class MessageBuffer(object):
         self.cache_size = 200
 
     def get_messages_since(self, cursor):
-        """Returns a list of messages newer than the given cursor.
+        """Returns a list of messages newer than the given cursor.S
         ``cursor`` should be the ``id`` of the last message received.
         """
         results = []

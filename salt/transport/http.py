@@ -60,6 +60,7 @@ class AsyncHTTPReqChannel(salt.transport.abstract.AbstractAsyncReqChannel):
     def start_channel(self, io_loop, **kwargs):
         publish_port = self.opts.get("publish_port", 4505)
         master = self.opts["master"]
+        # TODO: Initial request should just fetch last_message_id?
         self.url = "http://" + master + ":" + str(publish_port) + "/req"
         self.http_client = salt.ext.tornado.httpclient.AsyncHTTPClient(io_loop=self.io_loop)
 
@@ -281,10 +282,7 @@ class AsyncHTTPPubChannel(salt.transport.abstract.AbstractAsyncPubChannel):
         headers = {"x-ni-api-key": self.opts["x-ni-api-key"]}
         http_request = salt.ext.tornado.httpclient.HTTPRequest(self.url, method="POST", headers=headers, body=body)
         self.http_client = salt.ext.tornado.httpclient.AsyncHTTPClient(io_loop=self.io_loop)
-        
-        # TODO: Read from SSE. Let's sleep now to make it easier for debugging
         time.sleep(5)
-                
         self.http_client.fetch(http_request, self._handle_response)
 
     def _handle_response(self, response):
@@ -296,6 +294,7 @@ class AsyncHTTPPubChannel(salt.transport.abstract.AbstractAsyncPubChannel):
                 self._fire_http_request()
         else:
             message = json.loads(response.body)
+            message["enc"] = "aes" # minion doesn't run jobs if enc is not aes so hack it to be able to run jobs
             if self.callback:
                 self.io_loop.spawn_callback(self.callback, message)
             # Fire another long-polling request
